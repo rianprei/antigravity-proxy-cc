@@ -34,13 +34,18 @@ const BODY_CAP: usize = 32 * 1024 * 1024;
 const AGY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Static model table: (public id suffix, agy --model arg, display)
+/// Verified against strings from agy.real binary 2026-10-16.
+/// (High)/(Medium)/(Low) suffixes are reasoning EFFORTS (--effort flag),
+/// not separate models — the proxy maps output_config.effort to --effort.
 const MODELS: &[(&str, &str, &str)] = &[
-    (
-        "gemini-3.8-flash",
-        "Gemini 3.8 Flash (High)",
-        "Gemini 3.8 Flash",
-    ),
-    ("gemini-3.8-pro", "Gemini 3.8 Pro", "Gemini 3.8 Pro"),
+    ("gemini-4-argon", "Gemini 4 Argon (High)", "Gemini 4 Argon"),
+    ("gemini-3.8-flash", "Gemini 3.8 Flash (High)", "Gemini 3.8 Flash"),
+    ("gemini-3.7-flash", "Gemini 3.7 Flash (High)", "Gemini 3.7 Flash"),
+    ("gemini-3.6-flash", "Gemini 3.6 Flash (High)", "Gemini 3.6 Flash"),
+    ("gemini-3.5-flash", "Gemini 3.5 Flash (High)", "Gemini 3.5 Flash"),
+    ("gemini-3.1-pro", "Gemini 3.1 Pro (High)", "Gemini 3.1 Pro"),
+    ("gemini-3.1-flash", "Gemini 3.1 Flash", "Gemini 3.1 Flash"),
+    ("gemini-3-pro", "Gemini 3 Pro", "Gemini 3 Pro"),
 ];
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -515,7 +520,15 @@ mod tests {
             resolve_model("claude-gemini-3.8-flash:high"),
             Some("Gemini 3.8 Flash (High)")
         );
-        assert_eq!(resolve_model("gemini-3.8-pro"), Some("Gemini 3.8 Pro"));
+        assert_eq!(
+            resolve_model("gemini-4-argon"),
+            Some("Gemini 4 Argon (High)")
+        );
+        assert_eq!(
+            resolve_model("gemini-3.1-pro"),
+            Some("Gemini 3.1 Pro (High)")
+        );
+        assert_eq!(resolve_model("gemini-3-pro"), Some("Gemini 3 Pro"));
         assert_eq!(resolve_model("claude-sonnet-4"), None);
     }
 
