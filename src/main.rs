@@ -28,6 +28,10 @@ fn full_body(data: impl Into<Bytes>) -> BoxBody {
 
 const AGY_BIN: &str = "/home/rianprei/.local/bin/agy";
 const BODY_CAP: usize = 32 * 1024 * 1024;
+/// Hard cap on a single agy invocation. The CLI runs agent loops that can
+/// legitimately take minutes, but a hung subprocess must never wedge the
+/// proxy (current_thread runtime: one hang blocks every subsequent request).
+const AGY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Static model table: (public id suffix, agy --model arg, display)
 const MODELS: &[(&str, &str, &str)] = &[
@@ -134,12 +138,15 @@ struct AgyResult {
 
 async fn invoke_agy(prompt: &str, model: &str, effort: Option<&str>) -> Result<AgyResult, String> {
     let mut cmd = tokio::process::Command::new(AGY_BIN);
-    cmd.arg(format!("-p={prompt}"))
+    cmd.arg("-p")
+        .arg(prompt)
         .arg("--output-format")
         .arg("stream-json")
         .arg("--model")
         .arg(model)
         .arg("--dangerously-skip-permissions")
+        .arg("--print-timeout")
+        .arg("280s") // leave 20s headroom under our own 300s cap
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .current_dir("/tmp");
@@ -153,38 +160,55 @@ async fn invoke_agy(prompt: &str, model: &str, effort: Option<&str>) -> Result<A
         .map_err(|e| format!("failed to spawn agy: {e}"))?;
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
-    use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let reader = BufReader::new(stdout);
-    let mut lines = reader.lines();
+    // Wrap the ENTIRE read loop in a timeout: a hung agy (network stall,
+    // agent loop stuck) must never wedge the proxy. current_thread runtime
+    // means one hang would block every subsequent request.
+    let read_result = tokio::time::timeout(AGY_TIMEOUT, async {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
 
-    let mut result = AgyResult {
-        response: String::new(),
-        status: String::new(),
-        error: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        thinking_tokens: 0,
-    };
+        let mut result = AgyResult {
+            response: String::new(),
+            status: String::new(),
+            error: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            thinking_tokens: 0,
+        };
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        if v.get("event").and_then(Value::as_str) == Some("result") {
-            if let Some(r) = v.get("result") {
-                result.response = r.get("response").and_then(Value::as_str).unwrap_or("").to_string();
-                result.status = r.get("status").and_then(Value::as_str).unwrap_or("").to_string();
-                result.error = r.get("error").and_then(Value::as_str).map(String::from);
-                if let Some(u) = r.get("usage") {
-                    result.input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                    result.output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                    result.thinking_tokens = u.get("thinking_tokens").and_then(Value::as_u64).unwrap_or(0);
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v.get("event").and_then(Value::as_str) == Some("result") {
+                if let Some(r) = v.get("result") {
+                    result.response = r.get("response").and_then(Value::as_str).unwrap_or("").to_string();
+                    result.status = r.get("status").and_then(Value::as_str).unwrap_or("").to_string();
+                    result.error = r.get("error").and_then(Value::as_str).map(String::from);
+                    if let Some(u) = r.get("usage") {
+                        result.input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        result.output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        result.thinking_tokens = u.get("thinking_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    }
                 }
             }
         }
-    }
+        result
+    })
+    .await;
 
-    let _ = child.wait().await;
-    Ok(result)
+    match read_result {
+        Ok(result) => {
+            let _ = child.wait().await;
+            Ok(result)
+        }
+        Err(_elapsed) => {
+            // Timeout: kill the subprocess hard. A zombie agy process
+            // would leak file descriptors and memory on every retry.
+            let _ = child.kill().await;
+            Err("agy invocation timed out (300s cap)".to_string())
+        }
+    }
 }
 
 // ─── Main handler: POST /v1/messages ───────────────────────────────────────
@@ -214,6 +238,19 @@ async fn handle_messages(_cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
             .body(full_body(err.to_string()))
             .unwrap();
     }
+
+    // Linux ARG_MAX: 128KB per argument. Truncate with a loud marker rather
+    // than fail with an obscure OS error on very long prompts.
+    const MAX_PROMPT: usize = 120_000;
+    let prompt = if prompt.len() > MAX_PROMPT {
+        eprintln!("[antigravity-proxy] prompt truncated: {} bytes → {}", prompt.len(), MAX_PROMPT);
+        let mut s = prompt;
+        s.truncate(MAX_PROMPT);
+        s.push_str("\n\n[TRUNCATED: prompt exceeded 120KB ARG_MAX limit]");
+        s
+    } else {
+        prompt
+    };
 
     // Effort from output_config.effort (native Claude Code slider)
     let effort = body
