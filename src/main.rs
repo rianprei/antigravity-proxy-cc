@@ -8,14 +8,14 @@
 
 use std::sync::Arc;
 
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
-use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::Bytes;
-use serde_json::{json, Value};
 use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
 
 type BoxBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
@@ -35,7 +35,11 @@ const AGY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Static model table: (public id suffix, agy --model arg, display)
 const MODELS: &[(&str, &str, &str)] = &[
-    ("gemini-3.8-flash", "Gemini 3.8 Flash (High)", "Gemini 3.8 Flash"),
+    (
+        "gemini-3.8-flash",
+        "Gemini 3.8 Flash (High)",
+        "Gemini 3.8 Flash",
+    ),
     ("gemini-3.8-pro", "Gemini 3.8 Pro", "Gemini 3.8 Pro"),
 ];
 
@@ -52,7 +56,10 @@ fn resolve_model(model_id: &str) -> Option<&'static str> {
     let slug = model_id.strip_prefix("claude-").unwrap_or(model_id);
     // Strip :effort suffix
     let base = slug.split(':').next().unwrap_or(slug);
-    MODELS.iter().find(|(s, _, _)| *s == base).map(|(_, m, _)| *m)
+    MODELS
+        .iter()
+        .find(|(s, _, _)| *s == base)
+        .map(|(_, m, _)| *m)
 }
 
 // ─── Quota detection ────────────────────────────────────────────────────────
@@ -88,7 +95,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn parse_addr() -> std::net::SocketAddr {
     let raw = std::env::var("ANTIGRAVITY_PROXY_ADDR").unwrap_or_else(|_| "127.0.0.1:4113".into());
-    raw.parse().unwrap_or_else(|_| "127.0.0.1:4113".parse().unwrap())
+    raw.parse()
+        .unwrap_or_else(|_| "127.0.0.1:4113".parse().unwrap())
 }
 
 // ─── Extract prompt from Anthropic Messages ────────────────────────────────
@@ -103,16 +111,15 @@ fn extract_prompt(body: &Value) -> String {
                     Some(Value::Array(blocks)) => {
                         let text: Vec<String> = blocks
                             .iter()
-                            .filter_map(|b| {
-                                match b.get("type").and_then(Value::as_str)? {
-                                    "text" => b.get("text").and_then(Value::as_str).map(String::from),
-                                    "tool_result" => {
-                                        let inner = b.get("content").and_then(Value::as_str).unwrap_or("");
-                                        Some(format!("[tool_result: {inner}]"))
-                                    }
-                                    "image" => Some("[image]".into()),
-                                    _ => None,
+                            .filter_map(|b| match b.get("type").and_then(Value::as_str)? {
+                                "text" => b.get("text").and_then(Value::as_str).map(String::from),
+                                "tool_result" => {
+                                    let inner =
+                                        b.get("content").and_then(Value::as_str).unwrap_or("");
+                                    Some(format!("[tool_result: {inner}]"))
                                 }
+                                "image" => Some("[image]".into()),
+                                _ => None,
                             })
                             .collect();
                         return text.join("\n");
@@ -179,16 +186,31 @@ async fn invoke_agy(prompt: &str, model: &str, effort: Option<&str>) -> Result<A
         };
 
         while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if v.get("event").and_then(Value::as_str) == Some("result") {
                 if let Some(r) = v.get("result") {
-                    result.response = r.get("response").and_then(Value::as_str).unwrap_or("").to_string();
-                    result.status = r.get("status").and_then(Value::as_str).unwrap_or("").to_string();
+                    result.response = r
+                        .get("response")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    result.status = r
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     result.error = r.get("error").and_then(Value::as_str).map(String::from);
                     if let Some(u) = r.get("usage") {
-                        result.input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        result.output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        result.thinking_tokens = u.get("thinking_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        result.input_tokens =
+                            u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        result.output_tokens =
+                            u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        result.thinking_tokens = u
+                            .get("thinking_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
                     }
                 }
             }
@@ -243,7 +265,11 @@ async fn handle_messages(_cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
     // than fail with an obscure OS error on very long prompts.
     const MAX_PROMPT: usize = 120_000;
     let prompt = if prompt.len() > MAX_PROMPT {
-        eprintln!("[antigravity-proxy] prompt truncated: {} bytes → {}", prompt.len(), MAX_PROMPT);
+        eprintln!(
+            "[antigravity-proxy] prompt truncated: {} bytes → {}",
+            prompt.len(),
+            MAX_PROMPT
+        );
         let mut s = prompt;
         s.truncate(MAX_PROMPT);
         s.push_str("\n\n[TRUNCATED: prompt exceeded 120KB ARG_MAX limit]");
@@ -274,7 +300,8 @@ async fn handle_messages(_cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
     if result.status == "ERROR" {
         let error_msg = result.error.unwrap_or_default();
         if is_quota_error(&error_msg) {
-            let err = json!({"type":"error","error":{"type":"rate_limit_error","message":error_msg}});
+            let err =
+                json!({"type":"error","error":{"type":"rate_limit_error","message":error_msg}});
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("content-type", "application/json")
@@ -454,7 +481,9 @@ fn main() {
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(cfg.addr).await.expect("bind");
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
             let cfg = cfg.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
@@ -478,8 +507,14 @@ mod tests {
 
     #[test]
     fn test_resolve_model() {
-        assert_eq!(resolve_model("claude-gemini-3.8-flash"), Some("Gemini 3.8 Flash (High)"));
-        assert_eq!(resolve_model("claude-gemini-3.8-flash:high"), Some("Gemini 3.8 Flash (High)"));
+        assert_eq!(
+            resolve_model("claude-gemini-3.8-flash"),
+            Some("Gemini 3.8 Flash (High)")
+        );
+        assert_eq!(
+            resolve_model("claude-gemini-3.8-flash:high"),
+            Some("Gemini 3.8 Flash (High)")
+        );
         assert_eq!(resolve_model("gemini-3.8-pro"), Some("Gemini 3.8 Pro"));
         assert_eq!(resolve_model("claude-sonnet-4"), None);
     }
