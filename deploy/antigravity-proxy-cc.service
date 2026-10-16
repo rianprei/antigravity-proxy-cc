@@ -1,0 +1,45 @@
+[Unit]
+Description=antigravity-proxy-cc — Anthropic-compatible proxy for Google Antigravity (agy CLI)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/antigravity-proxy/proxy.env
+Environment=ANTIGRAVITY_PROXY_ADDR=127.0.0.1:4113
+Environment=MALLOC_ARENA_MAX=2
+# Wrapper proxy: o agy CLI (Go, ~300MB) roda como subprocess neste cgroup.
+# O proxy em si usa ~1.2MB. MemoryMax=256M OOM-killava o agy (2x no journal).
+# MemoryHigh=768M: soft throttle. MemoryMax=1G: hard cap com folga real.
+MemoryMin=16M
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+OOMScoreAdjust=-500
+Nice=-10
+CPUWeight=100
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+LimitNOFILE=524288
+TasksMax=256
+ExecStart=%h/.local/bin/antigravity-proxy-cc
+Restart=always
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+
+# Hardening: needs to spawn agy (subprocess) and read ~/.gemini/
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target
