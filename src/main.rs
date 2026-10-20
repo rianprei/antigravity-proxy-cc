@@ -33,19 +33,57 @@ const BODY_CAP: usize = 32 * 1024 * 1024;
 /// proxy (current_thread runtime: one hang blocks every subsequent request).
 const AGY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Static model table: (public id suffix, agy --model arg, display)
+/// Static model table: (public id suffix, agy --model arg, display, max_effort_level)
 /// Verified against strings from agy.real binary 2026-10-16.
-/// (High)/(Medium)/(Low) suffixes are reasoning EFFORTS (--effort flag),
-/// not separate models — the proxy maps output_config.effort to --effort.
-const MODELS: &[(&str, &str, &str)] = &[
-    ("gemini-4-argon", "Gemini 4 Argon (High)", "Gemini 4 Argon"),
-    ("gemini-3.8-flash", "Gemini 3.8 Flash (High)", "Gemini 3.8 Flash"),
-    ("gemini-3.7-flash", "Gemini 3.7 Flash (High)", "Gemini 3.7 Flash"),
-    ("gemini-3.6-flash", "Gemini 3.6 Flash (High)", "Gemini 3.6 Flash"),
-    ("gemini-3.5-flash", "Gemini 3.5 Flash (High)", "Gemini 3.5 Flash"),
-    ("gemini-3.1-pro", "Gemini 3.1 Pro (High)", "Gemini 3.1 Pro"),
-    ("gemini-3.1-flash", "Gemini 3.1 Flash", "Gemini 3.1 Flash"),
-    ("gemini-3-pro", "Gemini 3 Pro", "Gemini 3 Pro"),
+/// (High)/(Medium)/(Low) suffixes are reasoning EFFORTS, not separate models.
+/// `max_effort_level` = what the agy CLI accepts for this model:
+///   2 = low|medium|high (Flash line + Argon)
+///   1 = low|high only (Gemini 3.1 Pro — no "medium")
+///   0 = NO --effort flag at all (Gemini 3.1 Flash, Gemini 3 Pro)
+const MODELS: &[(&str, &str, &str, u8)] = &[
+    (
+        "gemini-4-argon",
+        "Gemini 4 Argon (High)",
+        "Gemini 4 Argon",
+        2,
+    ),
+    (
+        "gemini-3.8-flash",
+        "Gemini 3.8 Flash (High)",
+        "Gemini 3.8 Flash",
+        2,
+    ),
+    (
+        "gemini-3.7-flash",
+        "Gemini 3.7 Flash (High)",
+        "Gemini 3.7 Flash",
+        2,
+    ),
+    (
+        "gemini-3.6-flash",
+        "Gemini 3.6 Flash (High)",
+        "Gemini 3.6 Flash",
+        2,
+    ),
+    (
+        "gemini-3.5-flash",
+        "Gemini 3.5 Flash (High)",
+        "Gemini 3.5 Flash",
+        2,
+    ),
+    (
+        "gemini-3.1-pro",
+        "Gemini 3.1 Pro (High)",
+        "Gemini 3.1 Pro",
+        0,
+    ),
+    (
+        "gemini-3.1-flash",
+        "Gemini 3.1 Flash",
+        "Gemini 3.1 Flash",
+        0,
+    ),
+    ("gemini-3-pro", "Gemini 3 Pro", "Gemini 3 Pro", 0),
 ];
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -63,8 +101,20 @@ fn resolve_model(model_id: &str) -> Option<&'static str> {
     let base = slug.split(':').next().unwrap_or(slug);
     MODELS
         .iter()
-        .find(|(s, _, _)| *s == base)
-        .map(|(_, m, _)| *m)
+        .find(|(s, ..)| *s == base)
+        .map(|(_, m, ..)| *m)
+}
+
+/// Maximum --effort level this model accepts:
+/// 2 = low|medium|high, 1 = low|high only, 0 = no --effort flag.
+fn model_max_effort(model_id: &str) -> u8 {
+    let slug = model_id.strip_prefix("claude-").unwrap_or(model_id);
+    let base = slug.split(':').next().unwrap_or(slug);
+    MODELS
+        .iter()
+        .find(|(s, ..)| *s == base)
+        .map(|(_, _, _, lvl)| *lvl)
+        .unwrap_or(0)
 }
 
 // ─── Quota detection ────────────────────────────────────────────────────────
@@ -283,11 +333,23 @@ async fn handle_messages(_cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
         prompt
     };
 
-    // Effort from output_config.effort (native Claude Code slider)
-    let effort = body
+    // Effort: clamp to what the model actually supports. The agy CLI
+    // only accepts low|medium|high. Claude Code's slider sends xhigh/max
+    // — clamp to high. Models with max_effort=1 (3.1 Pro) reject "medium"
+    // — clamp medium to high. Models with max_effort=0 don't accept
+    // --effort at all (skip it entirely).
+    let requested_effort = body
         .pointer("/output_config/effort")
         .and_then(Value::as_str)
         .filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max"));
+    let max_effort = model_max_effort(&model_id);
+    let effort = requested_effort
+        .map(|e| match e {
+            "xhigh" | "max" => "high",            // agy has no such mode
+            "medium" if max_effort < 2 => "high", // 3.1 Pro has no medium
+            other => other,
+        })
+        .filter(|_| max_effort > 0);
 
     let result = match invoke_agy(&prompt, agy_model, effort).await {
         Ok(r) => r,
@@ -384,7 +446,7 @@ async fn route(cfg: Arc<Cfg>, req: Request<Incoming>) -> Response<BoxBody> {
     if method == "GET" && path == "/v1/models" {
         let models: Vec<Value> = MODELS
             .iter()
-            .map(|(slug, _, display)| {
+            .map(|(slug, _, display, _)| {
                 json!({"id":format!("claude-{slug}"),"display_name":display,"type":"model","created_at":"2026-10-16T00:00:00Z"})
             })
             .collect();
@@ -530,6 +592,17 @@ mod tests {
         );
         assert_eq!(resolve_model("gemini-3-pro"), Some("Gemini 3 Pro"));
         assert_eq!(resolve_model("claude-sonnet-4"), None);
+    }
+
+    #[test]
+    fn test_max_effort_level() {
+        // Flash line + Argon: low|medium|high
+        assert_eq!(model_max_effort("claude-gemini-3.8-flash"), 2);
+        assert_eq!(model_max_effort("claude-gemini-4-argon"), 2);
+        // 3.1 Pro, 3.1 Flash, 3 Pro: NO --effort support (confirmed by agy CLI)
+        assert_eq!(model_max_effort("claude-gemini-3.1-pro"), 0);
+        assert_eq!(model_max_effort("claude-gemini-3.1-flash"), 0);
+        assert_eq!(model_max_effort("claude-gemini-3-pro"), 0);
     }
 
     #[test]
