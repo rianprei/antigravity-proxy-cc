@@ -67,13 +67,13 @@ const MODELS: &[(&str, &str, &str, &str)] = &[
         "claude-sonnet-4-6",
     ),
     (
-        "claude-sonnet-4-6",
+        "agy-sonnet-4-6",
         "claude-sonnet-4-6",
         "Claude Sonnet 4.6 (via agy)",
         "claude-sonnet-4-6",
     ),
     (
-        "claude-opus-4-6",
+        "agy-opus-4-6",
         "claude-opus-4-6-thinking",
         "Claude Opus 4.6 (via agy)",
         "claude-opus-4-8",
@@ -207,8 +207,7 @@ async fn invoke_agy(prompt: &str, model: &str) -> Result<AgyResult, String> {
         .arg(model)
         .arg("--dangerously-skip-permissions")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        ;
+        .stderr(std::process::Stdio::null());
 
     // --effort omitido: o nível de esforço já está no nome do modelo.
 
@@ -594,7 +593,7 @@ mod tests {
             Some("gpt-oss-120b-medium")
         );
         assert_eq!(
-            resolve_model("claude-claude-sonnet-4-6"),
+            resolve_model("claude-agy-sonnet-4-6"),
             Some("claude-sonnet-4-6")
         );
         assert_eq!(resolve_model("claude-sonnet-4-6"), None); // native claude, not proxied
