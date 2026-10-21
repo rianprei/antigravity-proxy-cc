@@ -24,6 +24,11 @@ fn full_body(data: impl Into<Bytes>) -> BoxBody {
     UnsyncBoxBody::new(Full::new(data.into()).map_err(|e| match e {}))
 }
 
+/// One Anthropic SSE event, ready to write to the wire.
+fn sse(event: &str, data: &Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const AGY_BIN: &str = "/home/rianprei/.local/bin/agy";
@@ -348,6 +353,14 @@ async fn handle_messages(_cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
         prompt
     };
 
+    // Claude Code requires streaming by default; agy print-mode returns the
+    // complete answer at the end, so we buffer it and emit the Anthropic SSE
+    // event sequence in one go when stream=true.
+    let is_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let result = match invoke_agy(&prompt, agy_model).await {
         Ok(r) => r,
         Err(e) => {
@@ -381,13 +394,76 @@ async fn handle_messages(_cfg: Arc<Cfg>, body: Value) -> Response<BoxBody> {
             .unwrap();
     }
 
-    // Success: build Anthropic Messages response
+    // Success: Anthropic Messages shape.
+    let msg_id = format!(
+        "msg_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let text = result.response;
+
+    if is_stream {
+        // Claude Code speaks Anthropic SSE. Emit the full event sequence.
+        let mut out = String::new();
+        out.push_str(&sse(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "model": model_id, "content": [],
+                    "stop_reason": null, "stop_sequence": null,
+                    "usage": {"input_tokens": result.input_tokens, "output_tokens": 0}
+                }
+            }),
+        ));
+        out.push_str(&sse("ping", &json!({"type": "ping"})));
+        out.push_str(&sse(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ));
+        out.push_str(&sse(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        ));
+        out.push_str(&sse(
+            "content_block_stop",
+            &json!({
+                "type": "content_block_stop", "index": 0
+            }),
+        ));
+        out.push_str(&sse(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": result.output_tokens}
+            }),
+        ));
+        out.push_str(&sse("message_stop", &json!({"type": "message_stop"})));
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(full_body(out))
+            .unwrap();
+    }
+
     let response_json = json!({
-        "id": format!("msg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+        "id": msg_id,
         "type": "message",
         "role": "assistant",
         "model": model_id,
-        "content": [{"type":"text","text":result.response}],
+        "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
         "stop_sequence": null,
         "usage": {
